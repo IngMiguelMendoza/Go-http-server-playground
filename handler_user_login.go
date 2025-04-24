@@ -2,25 +2,31 @@ package main
 
 import (
 	"chirpy/internal/auth"
+	"chirpy/internal/database"
 	"encoding/json"
-	"log"
 	"net/http"
 	"time"
 )
 
 const (
-	MAX_EXPIRATION_TIME int = 60 * 60
+	MAX_EXPIRATION_TIME           int = 60 * 60
+	REFRESH_TOKEN_EXPIRATION_TIME int = 60 * 24
 )
 
 func (config *apiConfig) apiUserLoginHandler(resp http.ResponseWriter, req *http.Request) {
-	type inputCredentials struct {
-		Password         string `json:"password"`
-		Email            string `json:"email"`
-		ExpiresInSeconds int    `json:"expires_in_seconds"`
+	type parameters struct {
+		Password string `json:"password"`
+		Email    string `json:"email"`
+	}
+
+	type response struct {
+		User
+		Token        string `json:"token"`
+		RefreshToken string `json:"refresh_token"`
 	}
 
 	decoder := json.NewDecoder(req.Body)
-	credentials := inputCredentials{}
+	credentials := parameters{}
 	err := decoder.Decode(&credentials)
 	if err != nil {
 		respondWithErrorJson(resp, http.StatusInternalServerError, "Error decoding login request body", err)
@@ -39,20 +45,36 @@ func (config *apiConfig) apiUserLoginHandler(resp http.ResponseWriter, req *http
 		return
 	}
 
-	expirationTime := time.Hour
-	if credentials.ExpiresInSeconds > 0 && credentials.ExpiresInSeconds < 3600 {
-		expirationTime = time.Duration(credentials.ExpiresInSeconds) * time.Second
+	accessToken, err := auth.MakeJWT(user.ID, config.wjtSecret, time.Hour)
+	if err != nil {
+		respondWithErrorJson(resp, http.StatusInternalServerError, "Couldn't create access JWT", err)
+		return
 	}
 
-	token, err := auth.MakeJWT(user.ID, config.wjtSecret, expirationTime)
+	stringToken, err := auth.MakeRefreshToken()
 	if err != nil {
-		log.Printf("Cannot create the JWT token, %s", err)
+		respondWithErrorJson(resp, http.StatusInternalServerError, "Couldn't create refresh token", err)
+		return
 	}
-	respondWithJSON(resp, http.StatusOK, User{
-		ID:        user.ID,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
-		Email:     user.Email,
-		Token:     token,
+
+	refreshToken, err := config.db.CreateToken(req.Context(), database.CreateTokenParams{
+		Token:     stringToken,
+		UserID:    user.ID,
+		ExpiresAt: time.Now().Add(time.Duration(REFRESH_TOKEN_EXPIRATION_TIME) * time.Hour),
+	})
+	if err != nil {
+		respondWithErrorJson(resp, http.StatusInternalServerError, "Couldn't save refresh token", err)
+		return
+	}
+
+	respondWithJSON(resp, http.StatusOK, response{
+		User: User{
+			ID:        user.ID,
+			CreatedAt: user.CreatedAt,
+			UpdatedAt: user.UpdatedAt,
+			Email:     user.Email,
+		},
+		Token:        accessToken,
+		RefreshToken: refreshToken.Token,
 	})
 }
